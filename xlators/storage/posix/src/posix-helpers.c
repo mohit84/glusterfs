@@ -1703,32 +1703,8 @@ is_fresh_file(struct timespec *ts)
 int
 posix_gfid_heal(xlator_t *this, const char *path, loc_t *loc, dict_t *xattr_req)
 {
-    /* The purpose of this function is to prevent a race
-       where an inode creation FOP (like mkdir/mknod/create etc)
-       races with lookup in the following way:
-
-               {create thread}       |    {lookup thread}
-                                     |
-                                     t0
-                  mkdir ("name")     |
-                                     t1
-                                     |     posix_gfid_set ("name", 2);
-                                     t2
-         posix_gfid_set ("name", 1); |
-                                     t3
-                  lstat ("name");    |     lstat ("name");
-
-      In the above case mkdir FOP would have resulted with GFID 2 while
-      it should have been GFID 1. It matters in the case where GFID would
-      have gotten set to 1 on other subvolumes of replciate/distribute
-
-      The "solution" here is that, if we detect lookup is attempting to
-      set a GFID on a file which is created very recently, but does not
-      yet have a GFID (i.e, between t1 and t2), then "fake" it as though
-      posix_gfid_heal was called at t0 instead.
-    */
-
     uuid_t uuid_curr;
+    uuid_t uuid_req;
     int ret = 0;
     struct stat stat = {
         0,
@@ -1783,8 +1759,36 @@ posix_gfid_heal(xlator_t *this, const char *path, loc_t *loc, dict_t *xattr_req)
             }
         }
     }
+    /* heal gfid only if gfid xattr is not present on the path */
+    if (ret != 16) {
+        ret = dict_get_gfuuid(xattr_req, "gfid-req", &uuid_req);
+        if (ret) {
+            gf_msg_debug(this->name, 0,
+                         "failed to get the gfid from dict for %s", loc->path);
+            ret = -1;
+            goto out;
+        }
+        if (gf_uuid_is_null(uuid_req)) {
+            gf_msg(this->name, GF_LOG_ERROR, EINVAL, P_MSG_NULL_GFID,
+                   "gfid is null for %s", loc ? loc->path : "");
+            ret = -1;
+            goto out;
+        }
 
-    (void)posix_gfid_set(this, path, loc, xattr_req, GF_CLIENT_PID_MAX, &ret);
+        ret = sys_lsetxattr(path, GFID_XATTR_KEY, uuid_req, 16, XATTR_CREATE);
+        if (ret == -1) {
+            gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_GFID_FAILED,
+                   "setting GFID on %s failed ", path);
+            goto out;
+        }
+        gf_uuid_copy(uuid_curr, uuid_req);
+        if (!S_ISDIR(stat.st_mode))
+            (void)posix_handle_hard(this, path, uuid_curr, &stat);
+        else
+            (void)posix_handle_soft(this, path, loc, uuid_curr, &stat);
+    }
+
+out:
     return 0;
 }
 
